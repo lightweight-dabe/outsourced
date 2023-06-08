@@ -1,0 +1,238 @@
+theory ODABE_Dec
+begin
+
+/*
+ * Author: Janneke van Oosterhout
+ * Date: March 2023
+ * Supervised by: Mohammed B. M. Kamel
+ */
+
+builtins: diffie-hellman, bilinear-pairing, hashing
+functions: 
+    gen/0, // generator
+    odabeEnc/4, // encryption algorithm takes as input a message m, attribute policy and publick keys of the AA that contain the attributes in the policy
+    odabeDec/2, // decryption algorithm takes as input the ciphertext and secret keys for the user for the attributes such that it satisfies the policy
+    skaODABE/4, // takes as input the secret key of AA, the gid of the user and an attribute, outputs the secret key for the user for the attribute
+    compNodeEnc/7, // used for the encryption computation of computational node, takes x, y, and z, the node ID and the gid of encryptor as input
+    compNodeDec/3, // used for the decryption computation of computational node, takes the secret keys and hash of gid raised to power p
+    raisedTo/2
+equations: odabeDec(odabeEnc(m, <att1, att2>, <varGen1, varGen2>, compNodeEnc(x, y, z, nodeID, gidEnc, pubk1, pubk2)), compNodeDec(raisedTo(skaODABE(sk1, gid, att1, AA1),p), raisedTo(skaODABE(sk2, gid, att2, AA2),p), raisedTo(h(gid),p))) = m
+
+/* Protocol */
+
+// Create users by generating a random gid and create random values x, y, z
+rule user_create:
+    [Fr(~gid), Fr(~x), Fr(~y), Fr(~z)]
+    --[Once(~gid), SecretVar(~x), SecretVar(~y), SecretVar(~z), UserGID(~gid)]->
+    [!UserID(~gid, $A), !Vars(~x, ~y, ~z, ~gid)]
+
+// Setup an authority: create a secret key 
+rule authority_setup:
+    let
+        sk = <~alpha, ~beta>
+        pubk = <em(gen, gen)^(~alpha), gen^(~beta)>
+    in
+    [Fr(~alpha), Fr(~beta)]
+    --[AA_Setup($AA), Secret_AA_key($AA, sk), Once(~alpha), Once(~beta), Public_key_AA($AA, pubk)]->
+    [Out(pubk), !AA_SecretKey($AA, sk), !AA_pubkey($AA, pubk), !AA_keys($AA, pubk, sk)]
+
+// Setup variables for an authority depending on user 
+rule authority_varGen:
+    let
+        sk = <~alpha, ~beta>
+        varGen = <gen^(~y), gen^(~z), (gen^(~beta))^(~z), em(gen, gen)^(~x), (em(gen, gen)^(~alpha))^(~z)>
+    in
+    [!Vars(~x, ~y, ~z, ~gid), !AA_keys(AA, pk, sk)]
+    --[AA_Setup_var(AA), SecretVar(varGen)]->
+    [!UserValues(varGen, ~gid, AA, pk)]
+
+// Long term key reveal on the secret key of the attribute authority
+rule reveal_AA_key:
+    [!AA_SecretKey($AA, sk)] 
+    --[RevealAA($AA)]-> 
+    [Out(sk)]
+
+// Create a computational node by generating a random ID
+rule comp_node_create:
+    [Fr(~nodeID)]
+    --[Once('CP')]->
+    [!CPNode(~nodeID)]
+
+// Create a secret key for a user for a specific attribute
+// Also couple the attribute to an authority
+rule create_keys_users:
+    let
+        keyGID = skaODABE(sk, ~gid, ~att, $AA)
+    in
+    [!AA_keys($AA, pk, sk), !UserID(~gid, $A), Fr(~att)]
+    --[CreateKey($A, ~att, ~gid), Once(~att), AttrAA(~att, $AA), Secret_key(keyGID), Once(keyGID), UserGID(~gid)]->
+    [!UserKeyCombi(~gid, keyGID, ~att, $AA, $A), !AttributeAuthority(~att, $AA, pk)]
+
+// Create an accessPolicy based on two attributes (assume they are coupled via an AND operator)
+rule create_AP:
+    let
+        accessPolicy = <~att1, ~att2>
+    in
+    [!AttributeAuthority(~att1, AA1, pk1), !AttributeAuthority(~att2, AA2, pk2)]
+    --[Create_AP(~att1, ~att2), Once(accessPolicy), Attribute(~att1, ~att2, accessPolicy), Neq(~att1, ~att2)]->
+    [!APState(~att1, ~att2, accessPolicy)]
+
+// Preparation phase of encryption, generate values to send to the computational node for pre-encryption
+rule encrypt_prepare:
+    [!Vars(~x, ~y, ~z, ~gid), !CPNode(~nodeID)]
+    --[StartEncrypt(~nodeID, ~gid)]->
+    [!CP_Encrypt(~x, ~y, ~z, ~nodeID, ~gid, $AA1, $AA2)]
+
+// Perform pre-encryption
+rule comp_node_encrypt:
+    let
+        preCompEnc = compNodeEnc(~x, ~y, ~z, ~nodeID, ~gid, pk1, pk2)
+    in
+    [!CP_Encrypt(~x, ~y, ~z, ~nodeID, ~gid, AA1, AA2), !AA_pubkey(AA1, pk1), !AA_pubkey(AA2, pk2)]
+    --[CPPreEncrypt(~nodeID, ~gid), SecretVar(preCompEnc)]->
+    [!PreEncrypt(preCompEnc, ~nodeID, ~gid, AA1, AA2)]
+
+// Encrypt message (create ciphertext) using the secret keys of the AAs containing the attributes of the accesspolicy 
+// and the pre-encryption of computational node
+rule encryptor:
+    let 
+        preCompEnc = compNodeEnc(~x, ~y, ~z, ~nodeID, ~gid, pk1, pk2)
+        ct = odabeEnc(~m, <~att1, ~att2>, <varGen1, varGen2>, preCompEnc)
+    in 
+    [!PreEncrypt(preCompEnc, ~nodeID, ~gid, AA1, AA2), Fr(~m), !APState(~att1, ~att2, accessPolicy), !AttributeAuthority(~att1, AA1, pk1), 
+        !AttributeAuthority(~att2, AA2, pk2), !UserID(~gid, U), !UserValues(varGen1, ~gid, AA1, pk1), !UserValues(varGen2, ~gid, AA2, pk2)]
+    --[Encrypt(AA1, AA2), Secret_m(~m), Neq(~att1, ~att2), EncryptAtt(~att1, ~att2), EncryptUser(~gid), OutCT(ct), EncryptCheck(AA1, AA2, ~att1, ~att2, pk1, pk2)]->
+    [Out(ct)]
+
+// Preparation phase of decryption, generate values to send to the computational node for pre-decryption
+rule decrypt_prepare:
+    let
+        preCompEnc = compNodeEnc(~x, ~y, ~z, ~nodeID, ~gid, pk1, pk2)
+        ct = odabeEnc(~m, <~att1, ~att2>, <varGen1, varGen2>, preCompEnc)
+        keyGID1p = raisedTo(keyGID1, ~p)
+        keyGID2p = raisedTo(keyGID2, ~p)
+        hGIDp = raisedTo(h(~gid), ~p)
+    in
+    [In(ct), !APState(~att1, ~att2, accessPolicy), !UserKeyCombi(~gid, keyGID1, ~att1, AA1, U), !UserKeyCombi(~gid, keyGID2, ~att2, AA2, U),
+         Fr(~p), !CPNode(~nodeID)]
+    --[StartDecrypt(~nodeID, ~gid), SecretVar(~p)]->
+    [!CP_Decrypt(ct, ~nodeID, ~gid, keyGID1p, keyGID2p, hGIDp), !DecryptorPrep(ct, ~att1, ~att2, U, ~gid, accessPolicy, AA1, AA2)]
+
+// Perform pre-decryption
+rule comp_node_decrypt:
+    let
+        preCompDec = compNodeDec(keyGID1p, keyGID2p, hGIDp)
+    in
+    [!CP_Decrypt(ct, ~nodeID, ~gid, keyGID1p, keyGID2p, hGIDp)]
+    --[CPPreDecrypt(~nodeID, ~gid), SecretVar(preCompDec)]->
+    [!PreDecrypt(preCompDec, ~nodeID, ~gid)]
+
+// Decrypt ciphertext using the pre-decryption of computational node
+rule decryptor:
+    let
+        preCompDec = compNodeDec(keyGID1p, keyGID2p, hGIDp)
+        ct = odabeEnc(~m, <~att1, ~att2>, <varGen1, varGen2>, preCompEnc)
+        message = odabeDec(ct, preCompDec)
+    in
+    [!PreDecrypt(preCompDec, ~nodeID, ~gid), !DecryptorPrep(ct, ~att1, ~att2, U, ~gid, accessPolicy, AA1, AA2)]
+    --[Decrypt(AA1, AA2), Eq(~m, message), Attribute(~att1, ~att2, accessPolicy), DecryptUser(~gid), DecryptAttUser(~att1, ~att2, U), InCT(ct), UserGID(~gid)]->
+    []
+
+/* trace restrictions */
+
+restriction Equality:
+  "All x y #i. Eq(x,y) @i ==> x = y"
+
+restriction Inequality:
+  "All x #i. Neq(x,x) @ #i ==> F"
+
+restriction Attribute:
+  "All x y ap #i. Attribute(x, y, ap) @i ==> (<x, y> = ap | <y, x> = ap)"
+
+restriction Once:
+  "All X #i #j. Once(X)@i & Once(X)@j ==> #i = #j"
+
+/* Security properties */
+
+// Check if setup and encrypt are executable
+lemma executable_setup_encrypt:
+  exists-trace
+    "Ex AA1 AA2 #i #j #k #l #m. AA_Setup(AA1)@i & AA_Setup(AA2)@j & AA_Setup_var(AA1)@l & AA_Setup_var(AA2)@m & Encrypt(AA1, AA2)@k"
+
+// Check if encrypt and decrypt are executable
+lemma executable_encrypt_decrypt:
+  exists-trace
+    "Ex AA1 AA2 #i #j. Encrypt(AA1, AA2)@i & Decrypt(AA1, AA2)@j"
+
+// Check if the entire protocol is executable
+lemma executable:
+  exists-trace
+    "Ex AA1 AA2 u att1 att2 cp gid gid2 #i #j #k #l #m #n #o #p #q #s #t #u #v #w #x. AA_Setup(AA1)@i & AA_Setup(AA2)@j & AA_Setup_var(AA1)@u & AA_Setup_var(AA2)@v &
+         CreateKey(u, att1, gid2)@k & CreateKey(u, att2, gid2)@l & AttrAA(att1, AA1)@m & AttrAA(att2, AA2)@n & Create_AP(att1, att2)@o & 
+         EncryptAtt(att1, att2)@p & DecryptAttUser(att1, att2, u)@q & StartEncrypt(cp, gid)@s & CPPreEncrypt(cp, gid)@t & StartDecrypt(cp, gid2)@w & CPPreDecrypt(cp, gid2)@x"
+
+// Check if both public and Secret keys are created
+lemma authority_setup_correct:
+    "All AA #i. AA_Setup_var(AA)@i ==> (Ex #j. AA_Setup(AA)@j & j < i)"
+
+// An adversary cannot learn the message m that is encrypted
+lemma secret_message:
+    "All m AA1 AA2 #i #j. Encrypt(AA1, AA2)@i & Secret_m(m)@j 
+    ==> ( not (Ex #k. K(m)@k)
+      | ((Ex #l. RevealAA(AA1)@l) & (Ex #l. RevealAA(AA2)@l)))"
+
+// Users cannot collude to decrypt a ciphertext
+// If two users each have one attribute of the accessPolicy, they cannot combine their keys to decrypt
+lemma collusion_resistant:
+    "All u1 u2 att1 att2 gid #i #j #k #l.
+    Create_AP(att1, att2)@i & EncryptAtt(att1, att2)@j & 
+    CreateKey(u1, att1, gid)@k & CreateKey(u2, att2, gid)@l & not(Ex #p. CreateKey(u1, att2, gid)@p) & not(Ex #q. CreateKey(u2, att1, gid)@q)
+    ==> not( (Ex #m. DecryptAttUser(att1, att2, u1)@m) | (Ex #n. DecryptAttUser(att1, att2, u2)@n))"
+
+// A user can only decrypt the ciphertext if it has the attributes according to the accessPolicy
+lemma only_decrypt_with_right_attributes:
+    "All u att1 att2 #i #j.
+    EncryptAtt(att1, att2)@i & DecryptAttUser(att1, att2, u)@j
+    ==> ((Ex gid #k. CreateKey(u, att1, gid)@k) & (Ex gid #l. CreateKey(u, att2, gid)@l))"
+
+// An adversary cannot learn the secret keys of the user
+lemma secret_user_key:
+    "All k #i. Secret_key(k)@i 
+    ==> ( not (Ex #k. K(k)@k))"
+
+// An attribute is only associated to one attribute authority
+lemma not_two_AA_same_attribute:
+    "All AA1 att #i. AttrAA(att, AA1)@i ==> not(Ex AA2 #j. AttrAA(att, AA2)@j & not(AA1 = AA2))"
+
+// An adversary cannot learn the secret key of an attribute authority
+lemma secret_AA_key:
+    "All AA k #i. Secret_AA_key(AA, k)@i ==> ( not (Ex #k. K(k)@k) | (Ex #l. RevealAA(AA)@l))" 
+
+// The user that sends values to computational node is also the user that encrypts the message
+lemma encrypt_cpnode:
+    "All u #i. EncryptUser(u)@i ==> (Ex id #j #k. StartEncrypt(id, u)@j & CPPreEncrypt(id, u)@k)"
+
+// The user that sends values to computational node is also the user that decrypts the message
+lemma decrypt_cpnode:
+    "All u #i. DecryptUser(u)@i ==> (Ex id #j #k. StartDecrypt(id, u)@j & CPPreDecrypt(id, u)@k)"
+
+// Ciphertext that is decrypted is also created before
+lemma sameCT:
+    "All ct #i. InCT(ct)@i ==> (Ex #j. OutCT(ct)@j)"
+
+// the x y z variables and variables that are generated, are not known to the attacker
+lemma secret_variable:
+    "All k #i. SecretVar(k)@i 
+    ==> ( not (Ex #k. K(k)@k))"    
+
+// Identity hiding (gid)
+lemma gid_hiding:
+    "All gid #i. UserGID(gid)@i 
+        ==> not (Ex #j. K(gid)@j)"
+
+// checks if the AAs that are used for encrypt are the correct ones (belong to public keys and attributes)
+lemma check_correct_AAs_encrypt:
+    "All AA1 AA2 att1 att2 pk1 pk2 #i. EncryptCheck(AA1, AA2, att1, att2, pk1, pk2)@i
+        ==> (Ex #j #k #l #m. Public_key_AA(AA1, pk1)@j & Public_key_AA(AA2, pk2)@k & AttrAA(att1, AA1)@l & AttrAA(att2, AA2)@m)"
+
+end
