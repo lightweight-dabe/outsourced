@@ -2,7 +2,7 @@ theory ODABE_Dec
 begin
 
 /*
- * Author: Anonymized
+ * Author: Anonymized.
  */
 
 builtins: diffie-hellman, bilinear-pairing, hashing

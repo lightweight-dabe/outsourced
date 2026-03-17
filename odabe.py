@@ -1,6 +1,6 @@
 #! /usr/bin/python3
 '''
-DABE Author: Anonymized
+DABE Author: Anonymized.
 '''
 from charm.toolbox.pairinggroup import PairingGroup,ZR,G1,G2,GT,pair
 from charm.toolbox.secretutil import SecretUtil
